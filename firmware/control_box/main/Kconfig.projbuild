@@ -1,0 +1,17 @@
+menu "Control box"
+    config HUB_IP
+        string "mavlink-router host IP"
+        default "192.168.2.134"
+    config HUB_PORT
+        int "mavlink-router UDP server port"
+        default 14560
+    config MAV_SYSID
+        int "Own MAVLink system ID (must match SYSID_MYGCS on the vehicle)"
+        default 255
+    config MAV_COMPID
+        int "Own MAVLink component ID"
+        default 25
+    config TARGET_SYSID
+        int "Target vehicle system ID (until shared selection exists)"
+        default 2
+endmenu

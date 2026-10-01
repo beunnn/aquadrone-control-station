@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+# ESP-IDF build output and local config
+firmware/**/build/
+firmware/**/sdkconfig
+firmware/**/sdkconfig.old
+firmware/**/managed_components/
+firmware/**/dependencies.lock
+# Generated MAVLink headers (run tools/gen_mavlink.sh)
+firmware/components/mavlink_headers/generated/
