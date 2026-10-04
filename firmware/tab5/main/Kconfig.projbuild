@@ -1,0 +1,38 @@
+menu "Tab5 selector"
+    config WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+    config WIFI_PASSWORD
+        string "Wi-Fi password (set via menuconfig; sdkconfig is not committed)"
+        default ""
+    config HUB_IP
+        string "mavlink-router host IP"
+        default "192.168.2.134"
+    config HUB_PORT
+        int "mavlink-router UDP server port (one per device)"
+        default 14561
+    config LOCAL_PORT
+        int "Local UDP port"
+        default 14562
+    config MAV_SYSID
+        int "Own MAVLink system ID"
+        default 254
+        help
+            Must NOT be the vehicle's SYSID_MYGCS (255): ArduPilot's GCS failsafe counts heartbeats
+            from that sysid, so the Tab5 would keep the failsafe from firing if the control box died.
+    config MAV_COMPID
+        int "Own MAVLink component ID"
+        default 26
+    config MQTT_BROKER_URI
+        string "MQTT broker URI"
+        default "mqtt://192.168.2.134:1883"
+    config MQTT_USER
+        string "MQTT username"
+        default "tab5"
+    config MQTT_PASSWORD
+        string "MQTT password (set via menuconfig; sdkconfig is not committed)"
+        default ""
+    config NTP_SERVER
+        string "NTP server (for the selection timestamp)"
+        default "pool.ntp.org"
+endmenu

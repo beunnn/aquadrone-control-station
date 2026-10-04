@@ -13,6 +13,7 @@
 #include "mavlink_headers_cfg.h"
 #include "joystick.h"
 #include "buttons.h"
+#include "selection.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "ctrlbox";
@@ -79,7 +80,11 @@ static void send_msg(const mavlink_message_t *m)
     sendto(s_sock, buf, n, 0, (struct sockaddr *)&s_hub, sizeof(s_hub));
 }
 
+// Selected vehicle, 0 = none (nothing is sent). Only control_task changes it.
+static volatile int s_target_sysid;
+
 // ---- vehicle state, written by rx_task, read by control_task ------------------
+static volatile int s_hb_sysid;            // sender of s_last_hb_us, so a late heartbeat from the previous target is not trusted
 static volatile int64_t s_last_hb_us;      // last HEARTBEAT from the target vehicle (component 1)
 static volatile bool s_veh_armed;
 static volatile uint32_t s_veh_mode;
@@ -102,7 +107,7 @@ static volatile int s_ack_cmd = -1, s_ack_result;
 static void cmd_transmit(pending_cmd_t *c)
 {
     mavlink_message_t m;
-    mavlink_msg_command_long_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m, CONFIG_TARGET_SYSID, 1,
+    mavlink_msg_command_long_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m, s_target_sysid, 1,
                                   c->cmd, c->tries, c->p1, c->p2, 0, 0, 0, 0, 0);
     send_msg(&m);
     c->sent_us = esp_timer_get_time();
@@ -111,6 +116,7 @@ static void cmd_transmit(pending_cmd_t *c)
 
 static void cmd_start(const char *name, uint16_t cmd, float p1, float p2)
 {
+    if (s_target_sysid == 0) { ESP_LOGW(TAG, "cmd %s ignored: no vehicle selected", name); return; }
     s_pend = (pending_cmd_t){ .active = true, .cmd = cmd, .p1 = p1, .p2 = p2, .name = name };
     s_ack_cmd = -1;
     cmd_transmit(&s_pend);
@@ -173,10 +179,10 @@ static uint16_t to_pwm(float n) { return rc_clamp((int)(1500.0f + 500.0f * n + 0
 #define SPEED_SCALE_RAW(js) ((uint16_t)(65535 - (js).z))   // inverted: slider bottom = 2000 us, top = 1000 us
 static uint16_t speed_scale_pwm(uint16_t raw) { return rc_clamp(1000 + (int)(raw * 1000UL / 65535UL)); }
 
-static void send_override(uint16_t steer, uint16_t thr, uint16_t motor, uint16_t trim, uint16_t speed)
+static void send_override(int target, uint16_t steer, uint16_t thr, uint16_t motor, uint16_t trim, uint16_t speed)
 {
     mavlink_message_t m;
-    mavlink_msg_rc_channels_override_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m, CONFIG_TARGET_SYSID, 1,
+    mavlink_msg_rc_channels_override_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m, target, 1,
         steer, RC_IGNORE, thr, RC_IGNORE, RC_IGNORE, motor, trim, RC_IGNORE,
         RC_IGNORE, speed, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE);
     send_msg(&m);
@@ -213,7 +219,24 @@ static void control_task(void *arg)
         uint32_t ev = buttons_pressed_events();
         int64_t now = esp_timer_get_time();
         if (now < 5000000) continue;   // boot hold-off: ignore all button activity for the first 5 s
-        bool veh_ok = (now - s_last_hb_us) < VEH_LOST_US && s_last_hb_us != 0;
+
+        // --- shared vehicle selection; deferred during an e-stop pulse so the stop completes on the boat it was meant for ---
+        int req = selection_get();
+        if (req != s_target_sysid && !estop) {
+            int old = s_target_sysid;
+            if (ovr_enabled && old != 0) {
+                for (int i = 0; i < 5; i++) send_override(old, 1500, 1500, 1000, 1500, last_speed);   // neutral burst to the old boat
+            }
+            motor_on = false;
+            arm_ticks = 0;
+            s_pend.active = false;
+            s_veh_armed = false;
+            s_veh_mode = 0;
+            s_target_sysid = req;
+            ESP_LOGW(TAG, "target vehicle %d -> %d (motor off)", old, req);
+        }
+
+        bool veh_ok = s_target_sysid != 0 && s_hb_sysid == s_target_sysid && s_last_hb_us != 0 && (now - s_last_hb_us) < VEH_LOST_US;
 
         if (veh_ok != veh_ok_prev) {
             ESP_LOGW(TAG, "vehicle %s", veh_ok ? "heartbeat OK" : "heartbeat LOST");
@@ -237,9 +260,9 @@ static void control_task(void *arg)
             estop = false;
             ESP_LOGW(TAG, "emergency shutdown pulse ended, controls released (motor stays off)");
         }
-        if (estop && s_veh_armed && now - last_estop_cmd > 200000) {
+        if (estop && s_veh_armed && s_target_sysid != 0 && now - last_estop_cmd > 200000) {
             mavlink_message_t m;   // force disarm, repeated until the vehicle reports disarmed
-            mavlink_msg_command_long_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m, CONFIG_TARGET_SYSID, 1,
+            mavlink_msg_command_long_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m, s_target_sysid, 1,
                                           MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 21196, 0, 0, 0, 0, 0);
             send_msg(&m);
             last_estop_cmd = now;
@@ -250,7 +273,9 @@ static void control_task(void *arg)
             if (ovr_enabled) {
                 ovr_enabled = false;
                 motor_on = false;
-                for (int i = 0; i < 5; i++) send_override(1500, 1500, 1000, 1500, last_speed);  // neutral burst, then stop
+                if (s_target_sysid != 0) {
+                    for (int i = 0; i < 5; i++) send_override(s_target_sysid, 1500, 1500, 1000, 1500, last_speed);  // neutral burst, then stop
+                }
                 ESP_LOGW(TAG, "RC override DISABLED (no override messages are sent)");
             } else {
                 ovr_enabled = true;
@@ -282,7 +307,7 @@ static void control_task(void *arg)
 
         // --- RC override stream ---
         joystick_state_t js;
-        if (ovr_enabled && joystick_get(&js)) {
+        if (ovr_enabled && s_target_sysid != 0 && joystick_get(&js)) {
             uint16_t steer = to_pwm(axis_norm(js.x));
             uint16_t thr = (motor_on && !estop) ? to_pwm(-axis_norm(js.y)) : 1500;   // forward = Y low
             uint16_t motor = (motor_on && !estop) ? 2000 : 1000;
@@ -291,10 +316,10 @@ static void control_task(void *arg)
             if (estop) { steer = 1500; trim = 1500; }
             uint16_t speed = speed_scale_pwm(SPEED_SCALE_RAW(js));
             last_speed = speed;
-            send_override(steer, thr, motor, trim, speed);
+            send_override(s_target_sysid, steer, thr, motor, trim, speed);
             if (++n % 20 == 0)
                 ESP_LOGI(TAG, "RC override -> sys %d: ch1 %u ch3 %u ch6 %u ch7 %u ch10 %u | veh %s mode %lu",
-                         CONFIG_TARGET_SYSID, steer, thr, motor, trim, speed, s_veh_armed ? "ARMED" : "disarmed", (unsigned long)s_veh_mode);
+                         s_target_sysid, steer, thr, motor, trim, speed, s_veh_armed ? "ARMED" : "disarmed", (unsigned long)s_veh_mode);
         }
     }
 }
@@ -308,12 +333,14 @@ static void rx_task(void *arg)
         int n = recv(s_sock, buf, sizeof(buf), 0);
         for (int i = 0; i < n; i++) {
             if (!mavlink_parse_char(MAVLINK_COMM_0, buf[i], &msg, &st)) continue;
-            if (msg.sysid != CONFIG_TARGET_SYSID) continue;
+            int target = s_target_sysid;
+            if (target == 0 || msg.sysid != target) continue;
             if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT && msg.compid == 1) {
                 mavlink_heartbeat_t hb;
                 mavlink_msg_heartbeat_decode(&msg, &hb);
                 s_veh_armed = hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED;
                 s_veh_mode = hb.custom_mode;
+                s_hb_sysid = msg.sysid;
                 s_last_hb_us = esp_timer_get_time();
             } else if (msg.msgid == MAVLINK_MSG_ID_COMMAND_ACK) {
                 mavlink_command_ack_t ack;
@@ -342,6 +369,7 @@ void app_main(void)
     // Bind so the router learns a stable source port.
     struct sockaddr_in local = { .sin_family = AF_INET, .sin_port = htons(14561), .sin_addr.s_addr = htonl(INADDR_ANY) };
     bind(s_sock, (struct sockaddr *)&local, sizeof(local));
+    selection_start();
 
     xTaskCreate(heartbeat_task, "hb", 4096, NULL, 5, NULL);
     xTaskCreate(rx_task, "rx", 8192, NULL, 5, NULL);

@@ -11,7 +11,13 @@ menu "Control box"
     config MAV_COMPID
         int "Own MAVLink component ID"
         default 25
-    config TARGET_SYSID
-        int "Target vehicle system ID (until shared selection exists)"
-        default 2
+    config MQTT_BROKER_URI
+        string "MQTT broker URI (shared vehicle selection)"
+        default "mqtt://192.168.2.134:1883"
+    config MQTT_USER
+        string "MQTT username"
+        default "ctrlbox"
+    config MQTT_PASSWORD
+        string "MQTT password (set via menuconfig; sdkconfig is not committed)"
+        default ""
 endmenu

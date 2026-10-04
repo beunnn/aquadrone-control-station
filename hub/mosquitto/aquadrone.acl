@@ -1,0 +1,19 @@
+# Selection publisher (touchscreen)
+user tab5
+topic readwrite aquadrone/target_sysid
+topic readwrite aquadrone/ctrl/tab5/status
+topic read aquadrone/ctrl/+/status
+
+# Control box only follows the selection
+user ctrlbox
+topic read aquadrone/target_sysid
+topic readwrite aquadrone/ctrl/ctrlbox/status
+
+# Pi-side GCS selection filter
+user filter
+topic read aquadrone/target_sysid
+topic readwrite aquadrone/ctrl/filter/status
+
+# Dev PC / bench testing with mosquitto_pub/sub
+user operator
+topic readwrite aquadrone/#

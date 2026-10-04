@@ -1,0 +1,4 @@
+{
+    "cmake.sourceDirectory": "C:/Soft_Dev/aquadrone-control-station/firmware/control_box",
+    "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.5.4/"
+}
