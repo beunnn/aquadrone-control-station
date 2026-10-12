@@ -1,13 +1,17 @@
-#pragma once
+#ifndef WIFI_H
+#define WIFI_H
+
 #include <stdbool.h>
 #include <stddef.h>
 
-// Starts the Wi-Fi station (via the on-board ESP32-C6) and reconnects forever. Also creates the default event loop.
-// Never aborts: if the C6 does not respond, initialisation is retried in the background.
-void wifi_start(void);
+// Starts the Wi-Fi station through the on-board ESP32-C6 and reconnects forever; also creates the default event loop.
+// Never aborts: if the C6 does not respond, initialisation is retried in the background. Called once from app_main.
+void wifiStart( void );
 
-// Copies the current IP into buf; returns false (and an empty string) while not connected.
-bool wifi_ip(char *buf, size_t len);
+// Copies the current IP into buffer; returns false (and an empty string) while not connected.
+bool wifiIp( char* buffer, size_t length );
 
 // Short state text for the status bar while not connected.
-const char *wifi_state_text(void);
+const char* wifiStateText( void );
+
+#endif

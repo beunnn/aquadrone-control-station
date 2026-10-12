@@ -1,21 +1,38 @@
-#pragma once
-#include <stdint.h>
+#ifndef BUTTONS_H
+#define BUTTONS_H
+
 #include <stdbool.h>
+#include <stdint.h>
 
-// Logical buttons, wired between the GPIO and GND (internal pull-up, active low).
-typedef enum {
-    BTN_MODE1, BTN_MODE2, BTN_MODE3, BTN_MODE4,  // Manual, Hold, Auto, RTL
-    BTN_ARM, BTN_DISARM,
-    BTN_MOTOR_ON, BTN_MOTOR_OFF,
-    BTN_TRIM_UP, BTN_TRIM_DOWN,
-    BTN_ESTOP_A, BTN_ESTOP_B,
-    BTN_OVERRIDE_TOGGLE,
-    BTN_COUNT
-} button_t;
+// Logical control buttons. Which GPIO or joystick button drives each one is mapped in buttons.c.
+typedef enum
+{
+    // Modes: Manual, Hold, Auto, RTL.
+    buttonMode1,
+    buttonMode2,
+    buttonMode3,
+    buttonMode4,
+    buttonArm,
+    buttonDisarm,
+    buttonMotorOn,
+    buttonMotorOff,
+    buttonTrimUp,
+    buttonTrimDown,
+    buttonEstopA,
+    buttonEstopB,
+    buttonOverrideToggle,
+    buttonCount
+} buttonId_t;
 
-void buttons_start(void);
-// Debounced "currently held" bitmask (bit n = button n).
-uint32_t buttons_held(void);
-// Press events since the last call (rising edges, never lost between polls).
-uint32_t buttons_pressed_events(void);
-#define BTN_BIT(b) (1u << (b))
+#define BTN_BIT( button ) ( ( uint32_t )1U << ( uint32_t )( button ) )
+
+// Configures the GPIO buttons and starts the 5 ms debounce task. Called once from app_main before the joystick starts.
+void buttonsStart( void );
+
+// Debounced "currently held" bitmask (BTN_BIT per button); polled by the control task.
+uint32_t buttonsHeld( void );
+
+// Press events (rising edges) since the previous call, so none are lost between control-task polls.
+uint32_t buttonsPressedEvents( void );
+
+#endif

@@ -1,19 +1,31 @@
-#pragma once
-#include <stdbool.h>
+#ifndef SELECTION_H
+#define SELECTION_H
 
-typedef enum { DEV_UNKNOWN = -1, DEV_OFFLINE = 0, DEV_ONLINE = 1 } dev_state_t;
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef enum
+{
+    devUnknown = -1,
+    devOffline = 0,
+    devOnline = 1
+} devState_t;
 
 // Starts the MQTT client: follows the retained selection and the control-box presence, publishes our own presence.
-void selection_start(void);
+// Called once from app_main; esp-mqtt keeps reconnecting by itself.
+void selectionStart( void );
 
-// Publishes a new selection (retained). Returns false if the broker is not connected.
-bool selection_request(int sysid);
+// Publishes a new selection (retained). Returns false if the broker is not connected. Called from the UI on a card tap.
+bool selectionRequest( int32_t sysid );
 
 // Selection as confirmed by the broker (0 = none).
-int selection_current(void);
+int32_t selectionCurrent( void );
 
-// Last selection requested from this Tab5 that the broker has not echoed yet (0 = none pending).
-int selection_pending(void);
+// Selection requested from this Tab5 that the broker has not echoed yet (0 = none pending).
+int32_t selectionPending( void );
 
-bool selection_broker_connected(void);
-dev_state_t selection_ctrlbox_state(void);
+bool selectionBrokerConnected( void );
+
+devState_t selectionCtrlboxState( void );
+
+#endif

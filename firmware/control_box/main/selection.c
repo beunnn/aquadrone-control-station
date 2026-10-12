@@ -1,70 +1,121 @@
 // Follows the retained MQTT topic aquadrone/target_sysid (published by the Tab5) and reports presence.
+// Uses the ESP-IDF esp-mqtt client, which runs its own task and delivers events to onMqttEvent.
 #include "selection.h"
+
+#include <inttypes.h>
 #include <string.h>
+#include "cJSON.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
-#include "cJSON.h"
+#include "numericTypes.h"
 #include "sdkconfig.h"
 
-#define TOPIC_TARGET "aquadrone/target_sysid"
-#define TOPIC_STATUS "aquadrone/ctrl/ctrlbox/status"
+#define TOPIC_TARGET  "aquadrone/target_sysid"
+#define TOPIC_STATUS  "aquadrone/ctrl/ctrlbox/status"
+#define SYSID_INVALID ( -1 )
+#define SYSID_MIN     1
+#define SYSID_MAX     254
+#define KEEPALIVE_S   5
 
-static const char *TAG = "selection";
-static volatile int s_sysid;
+static const char* logTag = "selection";
 
-// Returns the sysid from {"sysid": N, ...}, 0 for an empty (cleared) payload, -1 if invalid.
-static int parse_sysid(const char *data, int len)
+static volatile int32_t selectedSysid = 0;
+
+// Returns the sysid from {"sysid": N, ...}, 0 for an empty (cleared) payload, SYSID_INVALID otherwise.
+static int32_t parseSysid( const char* data, int32_t length )
 {
-    if (len == 0) return 0;
-    cJSON *root = cJSON_ParseWithLength(data, len);
-    const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "sysid");
-    int id = -1;
-    if (cJSON_IsNumber(v) && v->valuedouble == (double)v->valueint && v->valueint >= 1 && v->valueint <= 254 && v->valueint != CONFIG_MAV_SYSID) id = v->valueint;
-    cJSON_Delete(root);
-    return id;
+    int32_t sysid = SYSID_INVALID;
+
+    if ( length == 0 ) { sysid = 0; }
+    else
+    {
+        // cJSON returns NULL for a parse error or missing key, and every call below accepts NULL.
+        cJSON* root = cJSON_ParseWithLength( data, ( size_t )length );
+
+        const cJSON* value = cJSON_GetObjectItemCaseSensitive( root, "sysid" );
+
+        // valuedouble == valueint rejects fractional numbers such as 2.5.
+        if ( ( cJSON_IsNumber( value ) != 0 ) && ( value->valuedouble == ( float64_t )value->valueint ) && ( value->valueint >= SYSID_MIN ) && ( value->valueint <= SYSID_MAX ) && ( value->valueint != CONFIG_MAV_SYSID ) ) { sysid = ( int32_t )value->valueint; }
+
+        cJSON_Delete( root );
+    }
+
+    return sysid;
 }
 
-static void on_mqtt(void *arg, esp_event_base_t base, int32_t id, void *data)
+// Applies a message received on the subscribed topics; only TOPIC_TARGET is subscribed.
+static void onMessage( const esp_mqtt_event_t* event )
 {
-    esp_mqtt_event_handle_t e = data;
-    switch ((esp_mqtt_event_id_t)id) {
-    case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "broker connected");
-        esp_mqtt_client_publish(e->client, TOPIC_STATUS, "online", 0, 1, 1);
-        esp_mqtt_client_subscribe(e->client, TOPIC_TARGET, 1);
-        break;
-    case MQTT_EVENT_DISCONNECTED:
-        // A broker outage must not drop control of the boat, so the last selection is kept.
-        ESP_LOGW(TAG, "broker disconnected, keeping target %d", s_sysid);
-        break;
-    case MQTT_EVENT_DATA:
-        if (e->topic_len != (int)strlen(TOPIC_TARGET) || memcmp(e->topic, TOPIC_TARGET, e->topic_len) != 0) break;
-        if (e->data_len != e->total_data_len) { ESP_LOGW(TAG, "fragmented selection message ignored"); break; }
-        int sysid = parse_sysid(e->data, e->data_len);
-        if (sysid < 0) { ESP_LOGW(TAG, "invalid selection payload '%.*s' ignored", e->data_len, e->data); break; }
-        if (sysid != s_sysid) ESP_LOGI(TAG, "selection %d -> %d", s_sysid, sysid);
-        s_sysid = sysid;
-        break;
-    case MQTT_EVENT_ERROR:
-        ESP_LOGW(TAG, "MQTT error");
-        break;
-    default:
-        break;
+    const bool isTarget = ( event->topic_len == ( int )strlen( TOPIC_TARGET ) ) && ( memcmp( event->topic, TOPIC_TARGET, ( size_t )event->topic_len ) == 0 );
+
+    if ( !isTarget ) { return; }
+
+    if ( event->data_len != event->total_data_len )
+    {
+        ESP_LOGW( logTag, "fragmented selection message ignored" );
+        return;
+    }
+
+    const int32_t sysid = parseSysid( event->data, ( int32_t )event->data_len );
+
+    if ( sysid < 0 )
+    {
+        ESP_LOGW( logTag, "invalid selection payload '%.*s' ignored", event->data_len, event->data );
+        return;
+    }
+
+    if ( sysid != selectedSysid ) { ESP_LOGI( logTag, "selection %" PRId32 " -> %" PRId32, selectedSysid, sysid ); }
+
+    selectedSysid = sysid;
+}
+
+// esp-mqtt event handler, runs in the MQTT client task.
+static void onMqttEvent( void* handlerArg, esp_event_base_t base, int32_t eventId, void* eventData )
+{
+    const esp_mqtt_event_handle_t event = ( esp_mqtt_event_handle_t )eventData;
+
+    ( void )handlerArg;
+    ( void )base;
+
+    switch ( ( esp_mqtt_event_id_t )eventId )
+    {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI( logTag, "broker connected" );
+            ( void )esp_mqtt_client_publish( event->client, TOPIC_STATUS, "online", 0, 1, 1 );
+            ( void )esp_mqtt_client_subscribe( event->client, TOPIC_TARGET, 1 );
+            break;
+
+        case MQTT_EVENT_DISCONNECTED:
+            // A broker outage must not drop control of the boat, so the last selection is kept.
+            ESP_LOGW( logTag, "broker disconnected, keeping target %" PRId32, selectedSysid );
+            break;
+
+        case MQTT_EVENT_DATA:
+            onMessage( event );
+            break;
+
+        case MQTT_EVENT_ERROR:
+            ESP_LOGW( logTag, "MQTT error" );
+            break;
+
+        default:
+            break;
     }
 }
 
-void selection_start(void)
+void selectionStart( void )
 {
-    const esp_mqtt_client_config_t cfg = {
+    const esp_mqtt_client_config_t config = {
         .broker.address.uri = CONFIG_MQTT_BROKER_URI,
         .credentials.username = CONFIG_MQTT_USER,
         .credentials.authentication.password = CONFIG_MQTT_PASSWORD,
-        .session.keepalive = 5,
+        .session.keepalive = KEEPALIVE_S,
         .session.last_will = { .topic = TOPIC_STATUS, .msg = "offline", .qos = 1, .retain = 1 },
     };
-    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
-    ESP_ERROR_CHECK(esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, on_mqtt, NULL));
-    ESP_ERROR_CHECK(esp_mqtt_client_start(client));
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init( &config );
+
+    ESP_ERROR_CHECK( esp_mqtt_client_register_event( client, ESP_EVENT_ANY_ID, onMqttEvent, NULL ) );
+    ESP_ERROR_CHECK( esp_mqtt_client_start( client ) );
 }
 
-int selection_get(void) { return s_sysid; }
+int32_t selectionGet( void ) { return selectedSysid; }

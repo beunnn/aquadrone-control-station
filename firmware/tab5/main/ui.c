@@ -1,184 +1,280 @@
 // Selector screen: status bar, current selection and one card per discovered vehicle; tapping a card selects it.
 // Everything below runs in the LVGL task (timer and event callbacks), so no extra locking is needed.
 #include "ui.h"
+
+#include <inttypes.h>
 #include <stdio.h>
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "lvgl.h"
 #include "link.h"
+#include "lvgl.h"
+#include "numericTypes.h"
 #include "selection.h"
 #include "wifi.h"
 
-#define REFRESH_MS      250
-#define HB_STALE_US     3000000
-#define COLOR_SELECTED  0x2E7D32
-#define COLOR_PENDING   0xF9A825
-#define COLOR_IDLE      0x9E9E9E
-#define COLOR_WARN      0xC62828
+#define REFRESH_MS       250U
+#define HB_STALE_US      3000000
+#define COLOR_SELECTED   0x2E7D32U
+#define COLOR_PENDING    0xF9A825U
+#define COLOR_IDLE       0x9E9E9EU
+#define COLOR_WARN       0xC62828U
+#define COLOR_TEXT       0xFFFFFFU
+#define COLOR_CARD       0x263238U
+#define COLOR_BACKGROUND 0x101418U
+#define TEXT_LEN         32U
+#define IP_TEXT_LEN      16U
+#define HUB_TEXT_LEN     24U
 
-typedef struct {
-    lv_obj_t *btn;
-    lv_obj_t *title;
-    lv_obj_t *detail;
+// One vehicle card; created on first sight of a vehicle and kept for the lifetime of the screen.
+typedef struct
+{
+    lv_obj_t* button;
+    lv_obj_t* title;
+    lv_obj_t* detail;
     uint8_t sysid;
 } card_t;
 
-static const char *TAG = "ui";
-static lv_obj_t *s_status;
-static lv_obj_t *s_selected;
-static lv_obj_t *s_list;
-static lv_obj_t *s_empty;
-static card_t s_cards[LINK_MAX_VEHICLES];
-static int s_ncards;
+static const char* logTag = "ui";
+static lv_obj_t* statusLabel;
+static lv_obj_t* selectedLabel;
+static lv_obj_t* cardList;
+static lv_obj_t* emptyLabel;
+static card_t cards[LINK_MAX_VEHICLES];
+static int32_t cardCount = 0;
 
-static const char *rover_mode_name(uint32_t mode)
+static const char* roverModeName( uint32_t mode )
 {
-    switch (mode) {
-    case 0:  return "MANUAL";
-    case 1:  return "ACRO";
-    case 3:  return "STEERING";
-    case 4:  return "HOLD";
-    case 5:  return "LOITER";
-    case 6:  return "FOLLOW";
-    case 7:  return "SIMPLE";
-    case 8:  return "DOCK";
-    case 9:  return "CIRCLE";
-    case 10: return "AUTO";
-    case 11: return "RTL";
-    case 12: return "SMART_RTL";
-    case 15: return "GUIDED";
-    case 16: return "INITIALISING";
-    default: return "?";
-    }
-}
+    const char* name = "?";
 
-static void on_card_clicked(lv_event_t *e)
-{
-    int sysid = (int)(intptr_t)lv_event_get_user_data(e);
-    if (sysid == selection_current()) return;
-    if (!selection_request(sysid)) ESP_LOGW(TAG, "select %d failed: broker not connected", sysid);
-}
-
-static card_t *card_for(uint8_t sysid)
-{
-    for (int i = 0; i < s_ncards; i++) {
-        if (s_cards[i].sysid == sysid) return &s_cards[i];
-    }
-    if (s_ncards == LINK_MAX_VEHICLES) return NULL;
-
-    card_t *c = &s_cards[s_ncards++];
-    c->sysid = sysid;
-    c->btn = lv_button_create(s_list);
-    lv_obj_set_size(c->btn, LV_PCT(100), LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(c->btn, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(c->btn, 20, 0);
-    lv_obj_set_style_pad_row(c->btn, 8, 0);
-    lv_obj_set_style_bg_color(c->btn, lv_color_hex(0x263238), 0);
-    lv_obj_set_style_border_width(c->btn, 6, 0);
-    lv_obj_add_event_cb(c->btn, on_card_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)sysid);
-    c->title = lv_label_create(c->btn);
-    lv_obj_set_style_text_font(c->title, &lv_font_montserrat_28, 0);
-    c->detail = lv_label_create(c->btn);
-    lv_obj_set_style_text_font(c->detail, &lv_font_montserrat_20, 0);
-    return c;
-}
-
-static void update_card( const vehicle_t *v, int64_t now, int selected, int pending )
-{
-    card_t *c = card_for( v->sysid );
-
-    if ( !c ) return;
-    
-    bool stale = ( now - v->last_hb_us ) > HB_STALE_US;
-    float age  = ( now - v->last_hb_us ) / 1e6f;
-
-    lv_label_set_text_fmt( c->title, "Boat %2u   %10s   %10s", v->sysid, v->armed ? "Armed" : "Disarmed", rover_mode_name( v->mode ) );
-
-    char batt[32] = "Batt --";
-    char gps[32]  = "GPS --";
-
-    if (v->has_batt) {
-        if (v->batt_pct >= 0) snprintf( batt, sizeof(batt), "Batt %.1f V %d%%", v->batt_mv / 1000.0f, v->batt_pct);
-        else                  snprintf( batt, sizeof(batt), "Batt %.1f V",      v->batt_mv / 1000.0f );
-    }
-
-    if (v->has_gps) snprintf( gps, sizeof( gps ), "GPS Fix %2u, %2u sats", v->gps_fix, v->gps_sats == 255 ? 0 : v->gps_sats );
-    
-    lv_label_set_text_fmt( c->detail,  "%s    %s     Link %s %.1f s", batt, gps, stale ? "LOST" : "ok", age );
-
-    uint32_t border = v->sysid == selected ? COLOR_SELECTED : (v->sysid == pending ? COLOR_PENDING : COLOR_IDLE );
-
-    lv_obj_set_style_border_color( c->btn,  lv_color_hex( border ), 0 );
-    lv_obj_set_style_text_color( c->title,  lv_color_hex( stale ? COLOR_IDLE : ( v->armed ? COLOR_WARN : 0xFFFFFF ) ), 0 );
-    lv_obj_set_style_text_color( c->detail, lv_color_hex( stale ? COLOR_IDLE : 0xFFFFFF ), 0 );
-}
-
-static void refresh( lv_timer_t *t )
-{
-    int64_t now = esp_timer_get_time();
-    char ip[16];
-    bool wifi_ok = wifi_ip( ip, sizeof( ip ) );
-    int64_t rx = link_last_rx_us();
-    dev_state_t box = selection_ctrlbox_state();
-
-    char hub[24];
-    
-    if ( rx == 0 ) snprintf( hub, sizeof( hub ), "No Data" );
-    else           snprintf( hub, sizeof( hub ), "%.1f s", ( now - rx) / 1e6f );
-
-    lv_label_set_text_fmt( s_status, " Wi-Fi %s   |   MQTT %s   |   Datahub %s   |   Control Box %s",
-                           wifi_ok ? ip : wifi_state_text(), selection_broker_connected() ? "OK" : "Down", hub,
-                           box == DEV_ONLINE ? "Online" : (box == DEV_OFFLINE ? "Offline" : "?" ) );
-
-    int selected = selection_current();
-    int pending  = selection_pending();
-
-    /**/ if ( pending  ) lv_label_set_text_fmt( s_selected, "Selecting boat %d ...", pending );
-    else if ( selected ) lv_label_set_text_fmt( s_selected, "Selected: boat %d", selected );
-    else                 lv_label_set_text(     s_selected, "No boat selected" );
-
-    lv_obj_set_style_text_color( s_selected, lv_color_hex( pending ? COLOR_PENDING : ( selected ? COLOR_SELECTED : COLOR_WARN ) ), 0 );
-
-    vehicle_t veh[LINK_MAX_VEHICLES];
-    int n = link_vehicles(veh, LINK_MAX_VEHICLES);
-
-    for ( int i = 0; i < n; i++ ) 
+    switch ( mode )
     {
-        update_card( &veh[i], now, selected, pending );
+        case 0U:
+            name = "MANUAL";
+            break;
+
+        case 1U:
+            name = "ACRO";
+            break;
+
+        case 3U:
+            name = "STEERING";
+            break;
+
+        case 4U:
+            name = "HOLD";
+            break;
+
+        case 5U:
+            name = "LOITER";
+            break;
+
+        case 6U:
+            name = "FOLLOW";
+            break;
+
+        case 7U:
+            name = "SIMPLE";
+            break;
+
+        case 8U:
+            name = "DOCK";
+            break;
+
+        case 9U:
+            name = "CIRCLE";
+            break;
+
+        case 10U:
+            name = "AUTO";
+            break;
+
+        case 11U:
+            name = "RTL";
+            break;
+
+        case 12U:
+            name = "SMART_RTL";
+            break;
+
+        case 15U:
+            name = "GUIDED";
+            break;
+
+        case 16U:
+            name = "INITIALISING";
+            break;
+
+        default:
+            name = "?";
+            break;
     }
 
-    if ( n > 0 ) lv_obj_set_hidden( s_empty, true );
+    return name;
 }
 
-void ui_start( void )
+// LV_EVENT_CLICKED on a card; the sysid travels in the event user data.
+static void onCardClicked( lv_event_t* event )
 {
-    lv_obj_t *scr = lv_screen_active();
-    lv_obj_set_style_bg_color( scr, lv_color_hex( 0x101418 ), 0 );
-    lv_obj_set_style_text_color( scr, lv_color_hex( 0xFFFFFF ), 0 );
-    lv_obj_set_flex_flow( scr, LV_FLEX_FLOW_COLUMN );
-    lv_obj_set_style_pad_all( scr, 20, 0 );
-    lv_obj_set_style_pad_row( scr, 16, 0 );
+    const int32_t sysid = ( int32_t )( intptr_t )lv_event_get_user_data( event );
 
-    s_status = lv_label_create( scr );
-    lv_obj_set_width( s_status, LV_PCT( 100 ) );
-    lv_label_set_long_mode( s_status, LV_LABEL_LONG_WRAP );
-    lv_obj_set_style_text_font( s_status, &lv_font_montserrat_20, 0 );
+    if ( sysid == selectionCurrent() ) { return; }
 
-    s_selected = lv_label_create( scr );
-    lv_obj_set_style_text_font( s_selected, &lv_font_montserrat_40, 0 );
+    if ( !selectionRequest( sysid ) ) { ESP_LOGW( logTag, "select %" PRId32 " failed: broker not connected", sysid ); }
+}
 
-    s_list = lv_obj_create( scr );
-    lv_obj_set_width( s_list, LV_PCT(100) );
-    lv_obj_set_flex_grow( s_list, 1 );
-    lv_obj_set_flex_flow( s_list, LV_FLEX_FLOW_COLUMN );
-    lv_obj_set_style_pad_row( s_list, 16, 0 );
-    lv_obj_set_style_bg_opa( s_list, LV_OPA_TRANSP, 0 );
-    lv_obj_set_style_border_width( s_list, 0, 0 );
+// Returns the card for sysid, creating it on first use; NULL when all cards are in use.
+static card_t* cardFor( uint8_t sysid )
+{
+    for ( int32_t index = 0; index < cardCount; index++ )
+    {
+        if ( cards[index].sysid == sysid ) { return &cards[index]; }
+    }
 
-    s_empty = lv_label_create( s_list );
-    lv_obj_set_style_text_font( s_empty, &lv_font_montserrat_28, 0 );
-    lv_label_set_text( s_empty, "Waiting for vehicle heartbeats ..." );
+    if ( cardCount == LINK_MAX_VEHICLES ) { return NULL; }
+
+    card_t* card = &cards[cardCount];
+    cardCount++;
+    card->sysid  = sysid;
+    card->button = lv_button_create( cardList );
+    lv_obj_set_size( card->button, LV_PCT( 100 ), LV_SIZE_CONTENT );
+    lv_obj_set_flex_flow( card->button, LV_FLEX_FLOW_COLUMN );
+    lv_obj_set_style_pad_all( card->button, 20, 0 );
+    lv_obj_set_style_pad_row( card->button, 8, 0 );
+    lv_obj_set_style_bg_color( card->button, lv_color_hex( COLOR_CARD ), 0 );
+    lv_obj_set_style_border_width( card->button, 6, 0 );
+    ( void )lv_obj_add_event_cb( card->button, onCardClicked, LV_EVENT_CLICKED, ( void* )( intptr_t )sysid );
+    card->title = lv_label_create( card->button );
+    lv_obj_set_style_text_font( card->title, &lv_font_montserrat_28, 0 );
+    card->detail = lv_label_create( card->button );
+    lv_obj_set_style_text_font( card->detail, &lv_font_montserrat_20, 0 );
+
+    return card;
+}
+
+static void updateCard( const vehicle_t* vehicle, int64_t now, int32_t selected, int32_t pending )
+{
+    card_t* card = cardFor( vehicle->sysid );
+
+    if ( card == NULL ) { return; }
+
+    const int64_t ageUs    = now - vehicle->lastHeartbeatUs;
+    const bool stale       = ageUs > HB_STALE_US;
+    const float32_t age    = ( float32_t )ageUs / 1e6f;
+    char battery[TEXT_LEN] = "Batt --";
+    char gps[TEXT_LEN]     = "GPS --";
+
+    uint32_t border = COLOR_IDLE;
+
+    lv_label_set_text_fmt( card->title, "Boat %2u   %10s   %10s", vehicle->sysid, vehicle->armed ? "Armed" : "Disarmed", roverModeName( vehicle->mode ) );
+
+    if ( vehicle->hasBattery )
+    {
+        if ( vehicle->batteryPercent >= 0 ) { ( void )snprintf( battery, sizeof( battery ), "Batt %.1f V %d%%", ( float64_t )vehicle->batteryMv / 1000.0, vehicle->batteryPercent ); }
+        else { ( void )snprintf( battery, sizeof( battery ), "Batt %.1f V", ( float64_t )vehicle->batteryMv / 1000.0 ); }
+    }
+
+    if ( vehicle->hasGps ) { ( void )snprintf( gps, sizeof( gps ), "GPS Fix %2u, %2u sats", vehicle->gpsFix, ( vehicle->gpsSats == LINK_SATS_UNKNOWN ) ? 0U : vehicle->gpsSats ); }
+
+    lv_label_set_text_fmt( card->detail, "%s    %s     Link %s %.1f s", battery, gps, stale ? "LOST" : "ok", ( float64_t )age );
+
+    if ( ( int32_t )vehicle->sysid == selected ) { border = COLOR_SELECTED; }
+    else if ( ( int32_t )vehicle->sysid == pending ) { border = COLOR_PENDING; }
+    else { border = COLOR_IDLE; }
+
+    lv_obj_set_style_border_color( card->button, lv_color_hex( border ), 0 );
+    lv_obj_set_style_text_color( card->title, lv_color_hex( stale ? COLOR_IDLE : ( vehicle->armed ? COLOR_WARN : COLOR_TEXT ) ), 0 );
+    lv_obj_set_style_text_color( card->detail, lv_color_hex( stale ? COLOR_IDLE : COLOR_TEXT ), 0 );
+}
+
+static const char* ctrlboxText( devState_t state )
+{
+    const char* text = "?";
+
+    if ( state == devOnline ) { text = "Online"; }
+    else if ( state == devOffline ) { text = "Offline"; }
+    else { text = "?"; }
+
+    return text;
+}
+
+// LVGL timer callback, every REFRESH_MS: copies the shared state and updates all labels and cards.
+static void refresh( lv_timer_t* timer )
+{
+    const int64_t now      = esp_timer_get_time();
+    const int64_t rxUs     = linkLastRxUs();
+    const int32_t selected = selectionCurrent();
+    const int32_t pending  = selectionPending();
+    char ip[IP_TEXT_LEN];
+    char hub[HUB_TEXT_LEN];
+    vehicle_t vehicleTable[LINK_MAX_VEHICLES];
+    uint32_t selectedColor = COLOR_WARN;
+
+    ( void )timer;
+    const bool wifiOk = wifiIp( ip, sizeof( ip ) );
+
+    if ( rxUs == 0 ) { ( void )snprintf( hub, sizeof( hub ), "No Data" ); }
+    else { ( void )snprintf( hub, sizeof( hub ), "%.1f s", ( float64_t )( now - rxUs ) / 1e6 ); }
+
+    lv_label_set_text_fmt( statusLabel, " Wi-Fi %s   |   MQTT %s   |   Datahub %s   |   Control Box %s", wifiOk ? ip : wifiStateText(), selectionBrokerConnected() ? "OK" : "Down", hub, ctrlboxText( selectionCtrlboxState() ) );
+
+    if ( pending != 0 )
+    {
+        lv_label_set_text_fmt( selectedLabel, "Selecting boat %" PRId32 " ...", pending );
+        selectedColor = COLOR_PENDING;
+    }
+    else if ( selected != 0 )
+    {
+        lv_label_set_text_fmt( selectedLabel, "Selected: boat %" PRId32, selected );
+        selectedColor = COLOR_SELECTED;
+    }
+    else
+    {
+        lv_label_set_text( selectedLabel, "No boat selected" );
+        selectedColor = COLOR_WARN;
+    }
+
+    lv_obj_set_style_text_color( selectedLabel, lv_color_hex( selectedColor ), 0 );
+
+    const int32_t vehicleCount = linkVehicles( vehicleTable, LINK_MAX_VEHICLES );
+
+    for ( int32_t index = 0; index < vehicleCount; index++ )
+    {
+        updateCard( &vehicleTable[index], now, selected, pending );
+    }
+
+    if ( vehicleCount > 0 ) { lv_obj_set_hidden( emptyLabel, true ); }
+}
+
+void uiStart( void )
+{
+    lv_obj_t* screen = lv_screen_active();
+
+    lv_obj_set_style_bg_color( screen, lv_color_hex( COLOR_BACKGROUND ), 0 );
+    lv_obj_set_style_text_color( screen, lv_color_hex( COLOR_TEXT ), 0 );
+    lv_obj_set_flex_flow( screen, LV_FLEX_FLOW_COLUMN );
+    lv_obj_set_style_pad_all( screen, 20, 0 );
+    lv_obj_set_style_pad_row( screen, 16, 0 );
+
+    statusLabel = lv_label_create( screen );
+    lv_obj_set_width( statusLabel, LV_PCT( 100 ) );
+    lv_label_set_long_mode( statusLabel, LV_LABEL_LONG_WRAP );
+    lv_obj_set_style_text_font( statusLabel, &lv_font_montserrat_20, 0 );
+
+    selectedLabel = lv_label_create( screen );
+    lv_obj_set_style_text_font( selectedLabel, &lv_font_montserrat_40, 0 );
+
+    cardList = lv_obj_create( screen );
+    lv_obj_set_width( cardList, LV_PCT( 100 ) );
+    lv_obj_set_flex_grow( cardList, 1 );
+    lv_obj_set_flex_flow( cardList, LV_FLEX_FLOW_COLUMN );
+    lv_obj_set_style_pad_row( cardList, 16, 0 );
+    lv_obj_set_style_bg_opa( cardList, LV_OPA_TRANSP, 0 );
+    lv_obj_set_style_border_width( cardList, 0, 0 );
+
+    emptyLabel = lv_label_create( cardList );
+    lv_obj_set_style_text_font( emptyLabel, &lv_font_montserrat_28, 0 );
+    lv_label_set_text( emptyLabel, "Waiting for vehicle heartbeats ..." );
 
     refresh( NULL );
-    lv_timer_create( refresh, REFRESH_MS, NULL );
+    ( void )lv_timer_create( refresh, REFRESH_MS, NULL );
 }

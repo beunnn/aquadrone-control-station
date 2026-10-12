@@ -1,377 +1,555 @@
-// Control box: Ethernet bring-up + MAVLink heartbeat over UDP to mavlink-router.
+// Control box (Waveshare ESP32-P4 dev kit): joystick and buttons to MAVLink RC overrides and commands over Ethernet/UDP
+// to mavlink-router, for the vehicle selected on the shared MQTT topic.
+#include <inttypes.h>
 #include <string.h>
-#include "esp_log.h"
 #include "esp_eth.h"
 #include "esp_eth_mac_esp.h"
-#include "esp_netif.h"
 #include "esp_event.h"
-#include "nvs_flash.h"
+#include "esp_log.h"
+#include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "lwip/sockets.h"
-#include "mavlink_headers_cfg.h"
-#include "joystick.h"
+#include "nvs_flash.h"
 #include "buttons.h"
-#include "selection.h"
+#include "joystick.h"
+#include "mavlink_headers_cfg.h"
+#include "numericTypes.h"
 #include "sdkconfig.h"
+#include "selection.h"
 
-static const char *TAG = "ctrlbox";
+// Waveshare ESP32-P4-Module-DEV-KIT: IP101GRI PHY over RMII with an external 50 MHz clock (pins from the schematic).
+#define ETH_MDC_GPIO      31
+#define ETH_MDIO_GPIO     52
+#define ETH_RST_GPIO      51
+#define ETH_CLK_GPIO      50
+#define ETH_PHY_ADDR_AUTO ( -1 )
+#define GOT_IP_BIT        BIT0
 
-// Waveshare ESP32-P4-Module-DEV-KIT: IP101GRI PHY, RMII, external 50 MHz clock on GPIO50
-#define ETH_MDC_GPIO   31
-#define ETH_MDIO_GPIO  52
-#define ETH_RST_GPIO   51
-#define ETH_PHY_ADDR   (-1)  // autodetect
+// Fixed local port so mavlink-router keeps the same learned endpoint across reboots.
+#define LOCAL_UDP_PORT 14561U
+#define RX_BUFFER_LEN  512U
 
-static EventGroupHandle_t s_ev;
-#define GOT_IP_BIT BIT0
+#define RC_IGNORE           UINT16_MAX
+#define RC_LOW              1000U
+#define RC_NEUTRAL          1500U
+#define RC_HIGH             2000U
+#define DEADBAND            0.08f
+#define EXPO                0.30f
+#define NEUTRAL_BURST_COUNT 5
 
-static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    const ip_event_got_ip_t *e = data;
-    ESP_LOGI(TAG, "IP " IPSTR " gw " IPSTR, IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw));
-    xEventGroupSetBits(s_ev, GOT_IP_BIT);
-}
-
-static void on_eth(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    ESP_LOGI(TAG, "ETH event %ld (%s)", (long)id,
-             id == ETHERNET_EVENT_CONNECTED ? "link up" :
-             id == ETHERNET_EVENT_DISCONNECTED ? "link down" : "other");
-}
-
-static void eth_start(void)
-{
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
-    esp_netif_t *netif = esp_netif_new(&cfg);
-
-    eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
-    eth_esp32_emac_config_t emac = ETH_ESP32_EMAC_DEFAULT_CONFIG();
-    emac.smi_gpio.mdc_num = ETH_MDC_GPIO;
-    emac.smi_gpio.mdio_num = ETH_MDIO_GPIO;
-    emac.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
-    emac.clock_config.rmii.clock_gpio = 50;
-    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&emac, &mac_cfg);
-
-    eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
-    phy_cfg.phy_addr = ETH_PHY_ADDR;
-    phy_cfg.reset_gpio_num = ETH_RST_GPIO;
-    esp_eth_phy_t *phy = esp_eth_phy_new_ip101(&phy_cfg);
-
-    esp_eth_handle_t eth = NULL;
-    esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
-    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_cfg, &eth));
-    ESP_ERROR_CHECK(esp_netif_attach(netif, esp_eth_new_netif_glue(eth)));
-    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, on_eth, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, on_got_ip, NULL));
-    ESP_ERROR_CHECK(esp_eth_start(eth));
-}
-
-static int s_sock = -1;
-static struct sockaddr_in s_hub;
-
-static void send_msg(const mavlink_message_t *m)
-{
-    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-    int n = mavlink_msg_to_send_buffer(buf, m);
-    sendto(s_sock, buf, n, 0, (struct sockaddr *)&s_hub, sizeof(s_hub));
-}
-
-// Selected vehicle, 0 = none (nothing is sent). Only control_task changes it.
-static volatile int s_target_sysid;
-
-// ---- vehicle state, written by rx_task, read by control_task ------------------
-static volatile int s_hb_sysid;            // sender of s_last_hb_us, so a late heartbeat from the previous target is not trusted
-static volatile int64_t s_last_hb_us;      // last HEARTBEAT from the target vehicle (component 1)
-static volatile bool s_veh_armed;
-static volatile uint32_t s_veh_mode;
-
-// ---- command sending with ACK / retry ------------------------------------------
-typedef struct {
-    bool active;
-    uint16_t cmd;
-    float p1, p2;
-    int tries;
-    int64_t sent_us;
-    const char *name;
-} pending_cmd_t;
-static pending_cmd_t s_pend;
-static volatile int s_ack_cmd = -1, s_ack_result;
-
-#define CMD_RETRY_US 1000000
-#define CMD_MAX_TRIES 3
-
-static void cmd_transmit(pending_cmd_t *c)
-{
-    mavlink_message_t m;
-    mavlink_msg_command_long_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m, s_target_sysid, 1,
-                                  c->cmd, c->tries, c->p1, c->p2, 0, 0, 0, 0, 0);
-    send_msg(&m);
-    c->sent_us = esp_timer_get_time();
-    c->tries++;
-}
-
-static void cmd_start(const char *name, uint16_t cmd, float p1, float p2)
-{
-    if (s_target_sysid == 0) { ESP_LOGW(TAG, "cmd %s ignored: no vehicle selected", name); return; }
-    s_pend = (pending_cmd_t){ .active = true, .cmd = cmd, .p1 = p1, .p2 = p2, .name = name };
-    s_ack_cmd = -1;
-    cmd_transmit(&s_pend);
-    ESP_LOGI(TAG, "cmd %s sent", name);
-}
-
-static void cmd_service(void)
-{
-    if (!s_pend.active) return;
-    if (s_ack_cmd == s_pend.cmd) {
-        ESP_LOGI(TAG, "cmd %s ACK result %d (%s)", s_pend.name, s_ack_result, s_ack_result == 0 ? "accepted" : "REJECTED");
-        s_pend.active = false;
-        return;
-    }
-    if (esp_timer_get_time() - s_pend.sent_us > CMD_RETRY_US) {
-        if (s_pend.tries >= CMD_MAX_TRIES) {
-            ESP_LOGW(TAG, "cmd %s: no ACK after %d tries", s_pend.name, s_pend.tries);
-            s_pend.active = false;
-        } else {
-            cmd_transmit(&s_pend);
-        }
-    }
-}
-
-static void heartbeat_task(void *arg)
-{
-    for (;;) {
-        mavlink_message_t m;
-        mavlink_msg_heartbeat_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m,
-                                   MAV_TYPE_GCS, MAV_AUTOPILOT_INVALID, 0, 0, MAV_STATE_ACTIVE);
-        send_msg(&m);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-// ---- joystick -> RC override ----------------------------------------------------
-#define RC_IGNORE UINT16_MAX
-#define DEADBAND  0.08f
-#define EXPO      0.30f
-
-static float axis_norm(uint16_t raw)  // -1..1
-{
-    float v = ((int)raw - 32768) / 32767.0f;
-    if (v > 1) v = 1;
-    if (v < -1) v = -1;
-    float a = v < 0 ? -v : v;
-    if (a < DEADBAND) return 0;
-    a = (a - DEADBAND) / (1.0f - DEADBAND);
-    a = (1 - EXPO) * a + EXPO * a * a * a;
-    return v < 0 ? -a : a;
-}
-
-// The boat's companion computer rejects RC values outside 1000..2000 on the channels it checks
-// (1, 3, 6, 7), so everything sent on those channels is clamped into range.
-static uint16_t rc_clamp(int v) { return v < 1000 ? 1000 : (v > 2000 ? 2000 : v); }
-static uint16_t to_pwm(float n) { return rc_clamp((int)(1500.0f + 500.0f * n + 0.5f)); }
-
-// RC10: throttle speed scale used by the companion computer, driven by a joystick axis (0..65535 -> 1000..2000 us).
-// Which physical axis is the slider is set here (verified on the bench; see docs/joystick.md).
-#define SPEED_SCALE_RAW(js) ((uint16_t)(65535 - (js).z))   // inverted: slider bottom = 2000 us, top = 1000 us
-static uint16_t speed_scale_pwm(uint16_t raw) { return rc_clamp(1000 + (int)(raw * 1000UL / 65535UL)); }
-
-static void send_override(int target, uint16_t steer, uint16_t thr, uint16_t motor, uint16_t trim, uint16_t speed)
-{
-    mavlink_message_t m;
-    mavlink_msg_rc_channels_override_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m, target, 1,
-        steer, RC_IGNORE, thr, RC_IGNORE, RC_IGNORE, motor, trim, RC_IGNORE,
-        RC_IGNORE, speed, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE);
-    send_msg(&m);
-}
-
-// Rover custom modes
+// ArduPilot Rover custom modes.
 #define ROVER_MODE_MANUAL 0
 #define ROVER_MODE_HOLD   4
 #define ROVER_MODE_AUTO   10
 #define ROVER_MODE_RTL    11
-#define ARM_HOLD_TICKS    16     // 16 x 50 ms = 0.8 s
-#define ESTOP_PULSE_US    3000000   // emergency-stop output lasts 3 s
-#define ESTOP_HOLD_TICKS  6      // 6 x 50 ms = 300 ms with both buttons held
-#define VEH_LOST_US       3000000
 
-static void control_task(void *arg)
+#define CONTROL_PERIOD_MS  50U
+#define BOOT_HOLDOFF_US    5000000
+#define ARM_HOLD_TICKS     16
+#define ESTOP_HOLD_TICKS   6
+#define ESTOP_PULSE_US     3000000
+#define ESTOP_REPEAT_US    200000
+#define FORCE_DISARM_MAGIC 21196.0f
+#define VEHICLE_LOST_US    3000000
+#define OVERRIDE_LOG_EVERY 20U
+#define CMD_RETRY_US       1000000
+#define CMD_MAX_TRIES      3
+
+// A discrete command (mode, arm, disarm) waiting for its COMMAND_ACK; resent until acknowledged or out of tries.
+typedef struct
 {
-    bool ovr_enabled = false;     // RC override output, OFF at boot
-    bool motor_on = false;
-    bool estop = false;           // true during the emergency-stop pulse
-    int64_t estop_end_us = 0;
-    bool estop_rearm = true;      // both stop buttons must be released before another stop can fire
-    int estop_ticks = 0;
-    int arm_ticks = 0;
-    int64_t last_estop_cmd = 0;
-    bool veh_ok_prev = false;
-    uint32_t n = 0;
-    uint16_t last_speed = 1000;
-    TickType_t last = xTaskGetTickCount();
+    bool active;
+    uint16_t command;
+    float32_t param1;
+    float32_t param2;
+    int32_t tries;
+    int64_t sentUs;
+    const char* name;
+} pendingCommand_t;
 
-    for (;;) {
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(50));  // 20 Hz
-        uint32_t held = buttons_held();
-        uint32_t ev = buttons_pressed_events();
-        int64_t now = esp_timer_get_time();
-        if (now < 5000000) continue;   // boot hold-off: ignore all button activity for the first 5 s
+static const char* logTag = "ctrlbox";
+static EventGroupHandle_t networkEvents;
+static int udpSocket = -1;
+static struct sockaddr_in hubAddress;
 
-        // --- shared vehicle selection; deferred during an e-stop pulse so the stop completes on the boat it was meant for ---
-        int req = selection_get();
-        if (req != s_target_sysid && !estop) {
-            int old = s_target_sysid;
-            if (ovr_enabled && old != 0) {
-                for (int i = 0; i < 5; i++) send_override(old, 1500, 1500, 1000, 1500, last_speed);   // neutral burst to the old boat
+// Selected vehicle, 0 = none (nothing is sent). Only controlTask changes it.
+static volatile int32_t targetSysid = 0;
+
+// Vehicle state, written by rxTask and read by controlTask. heartbeatSysid tags lastHeartbeatUs so that a late heartbeat
+// from the previously selected vehicle is not trusted for the new one.
+static volatile int32_t heartbeatSysid  = 0;
+static volatile int64_t lastHeartbeatUs = 0;
+static volatile bool vehicleArmed       = false;
+static volatile uint32_t vehicleMode    = 0U;
+
+static pendingCommand_t pendingCommand;
+static volatile int32_t ackCommand = -1;
+static volatile int32_t ackResult  = 0;
+
+// IP_EVENT_ETH_GOT_IP handler (ESP-IDF default event loop); releases app_main.
+static void onGotIp( void* arg, esp_event_base_t base, int32_t eventId, void* eventData )
+{
+    const ip_event_got_ip_t* event = ( const ip_event_got_ip_t* )eventData;
+
+    ( void )arg;
+    ( void )base;
+    ( void )eventId;
+    ESP_LOGI( logTag, "IP " IPSTR " gw " IPSTR, IP2STR( &event->ip_info.ip ), IP2STR( &event->ip_info.gw ) );
+    ( void )xEventGroupSetBits( networkEvents, GOT_IP_BIT );
+}
+
+// ETH_EVENT handler (ESP-IDF default event loop); link state is only logged.
+static void onEthernetEvent( void* arg, esp_event_base_t base, int32_t eventId, void* eventData )
+{
+    const char* state = "other";
+
+    ( void )arg;
+    ( void )base;
+    ( void )eventData;
+
+    if ( eventId == ETHERNET_EVENT_CONNECTED ) { state = "link up"; }
+    else if ( eventId == ETHERNET_EVENT_DISCONNECTED ) { state = "link down"; }
+    else { state = "other"; }
+
+    ESP_LOGI( logTag, "ETH event %" PRId32 " (%s)", eventId, state );
+}
+
+// Brings up the on-board Ethernet with DHCP; the IP arrives later in onGotIp.
+static void ethernetStart( void )
+{
+    esp_netif_config_t netifConfig = ESP_NETIF_DEFAULT_ETH();
+    eth_mac_config_t macConfig     = ETH_MAC_DEFAULT_CONFIG();
+
+    eth_esp32_emac_config_t emacConfig = ETH_ESP32_EMAC_DEFAULT_CONFIG();
+
+    eth_phy_config_t phyConfig = ETH_PHY_DEFAULT_CONFIG();
+    esp_eth_handle_t ethHandle = NULL;
+
+    ESP_ERROR_CHECK( esp_netif_init() );
+    ESP_ERROR_CHECK( esp_event_loop_create_default() );
+    esp_netif_t* netif = esp_netif_new( &netifConfig );
+
+    emacConfig.smi_gpio.mdc_num  = ETH_MDC_GPIO;
+    emacConfig.smi_gpio.mdio_num = ETH_MDIO_GPIO;
+
+    emacConfig.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
+    emacConfig.clock_config.rmii.clock_gpio = ETH_CLK_GPIO;
+
+    esp_eth_mac_t* mac = esp_eth_mac_new_esp32( &emacConfig, &macConfig );
+
+    phyConfig.phy_addr       = ETH_PHY_ADDR_AUTO;
+    phyConfig.reset_gpio_num = ETH_RST_GPIO;
+    esp_eth_phy_t* phy       = esp_eth_phy_new_ip101( &phyConfig );
+
+    const esp_eth_config_t ethConfig = ETH_DEFAULT_CONFIG( mac, phy );
+    ESP_ERROR_CHECK( esp_eth_driver_install( &ethConfig, &ethHandle ) );
+    ESP_ERROR_CHECK( esp_netif_attach( netif, esp_eth_new_netif_glue( ethHandle ) ) );
+    ESP_ERROR_CHECK( esp_event_handler_register( ETH_EVENT, ESP_EVENT_ANY_ID, onEthernetEvent, NULL ) );
+    ESP_ERROR_CHECK( esp_event_handler_register( IP_EVENT, IP_EVENT_ETH_GOT_IP, onGotIp, NULL ) );
+    ESP_ERROR_CHECK( esp_eth_start( ethHandle ) );
+}
+
+static void sendMessage( const mavlink_message_t* message )
+{
+    uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
+    const uint16_t length = mavlink_msg_to_send_buffer( buffer, message );
+
+    ( void )sendto( udpSocket, buffer, length, 0, ( const struct sockaddr* )&hubAddress, sizeof( hubAddress ) );
+}
+
+// Sends (or resends) the pending command to the selected vehicle; the confirmation field counts the attempts.
+static void commandTransmit( pendingCommand_t* command )
+{
+    mavlink_message_t message;
+
+    ( void )mavlink_msg_command_long_pack( CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &message, ( uint8_t )targetSysid, MAV_COMP_ID_AUTOPILOT1, command->command, ( uint8_t )command->tries, command->param1, command->param2, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f );
+    sendMessage( &message );
+    command->sentUs = esp_timer_get_time();
+    command->tries++;
+}
+
+// Starts a new discrete command; replaces any command still waiting for its ACK.
+static void commandStart( const char* name, uint16_t command, float32_t param1, float32_t param2 )
+{
+    if ( targetSysid == 0 )
+    {
+        ESP_LOGW( logTag, "cmd %s ignored: no vehicle selected", name );
+        return;
+    }
+
+    pendingCommand = ( pendingCommand_t ){ .active = true, .command = command, .param1 = param1, .param2 = param2, .tries = 0, .sentUs = 0, .name = name };
+    ackCommand     = -1;
+    commandTransmit( &pendingCommand );
+    ESP_LOGI( logTag, "cmd %s sent", name );
+}
+
+// Called every control cycle: finishes the pending command on its ACK, otherwise retries every second.
+static void commandService( void )
+{
+    if ( !pendingCommand.active ) { return; }
+
+    if ( ackCommand == ( int32_t )pendingCommand.command )
+    {
+        ESP_LOGI( logTag, "cmd %s ACK result %" PRId32 " (%s)", pendingCommand.name, ackResult, ( ackResult == 0 ) ? "accepted" : "REJECTED" );
+        pendingCommand.active = false;
+    }
+    else if ( ( esp_timer_get_time() - pendingCommand.sentUs ) > CMD_RETRY_US )
+    {
+        if ( pendingCommand.tries >= CMD_MAX_TRIES )
+        {
+            ESP_LOGW( logTag, "cmd %s: no ACK after %" PRId32 " tries", pendingCommand.name, pendingCommand.tries );
+            pendingCommand.active = false;
+        }
+        else { commandTransmit( &pendingCommand ); }
+    }
+    else
+    {
+        // Still waiting for the ACK.
+    }
+}
+
+// ArduPilot expects a 1 Hz heartbeat from a control source; it also lets the router learn this endpoint.
+static void heartbeatTask( void* arg )
+{
+    ( void )arg;
+
+    for ( ;; )
+    {
+        mavlink_message_t message;
+
+        ( void )mavlink_msg_heartbeat_pack( CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &message, MAV_TYPE_GCS, MAV_AUTOPILOT_INVALID, 0U, 0U, MAV_STATE_ACTIVE );
+        sendMessage( &message );
+        vTaskDelay( pdMS_TO_TICKS( 1000U ) );
+    }
+}
+
+// Maps a raw axis to -1..1 with deadband and expo; the deadband also hides the ~7 % cross-talk between X and Y.
+static float32_t axisNormalise( uint16_t raw )
+{
+    float32_t value  = ( float32_t )( ( int32_t )raw - 32768 ) / 32767.0f;
+    float32_t shaped = 0.0f;
+
+    if ( value > 1.0f ) { value = 1.0f; }
+
+    if ( value < -1.0f ) { value = -1.0f; }
+
+    const float32_t magnitude = ( value < 0.0f ) ? -value : value;
+
+    if ( magnitude >= DEADBAND )
+    {
+        const float32_t scaled = ( magnitude - DEADBAND ) / ( 1.0f - DEADBAND );
+
+        shaped = ( ( 1.0f - EXPO ) * scaled ) + ( EXPO * scaled * scaled * scaled );
+    }
+
+    return ( value < 0.0f ) ? -shaped : shaped;
+}
+
+// The boat's companion computer rejects RC values outside 1000..2000 on the channels it checks (1, 3, 6, 7, 10).
+static uint16_t rcClamp( int32_t value )
+{
+    uint16_t clamped = RC_NEUTRAL;
+
+    if ( value < ( int32_t )RC_LOW ) { clamped = RC_LOW; }
+    else if ( value > ( int32_t )RC_HIGH ) { clamped = RC_HIGH; }
+    else { clamped = ( uint16_t )value; }
+
+    return clamped;
+}
+
+static uint16_t toPwm( float32_t normalised ) { return rcClamp( ( int32_t )( ( float32_t )RC_NEUTRAL + ( 500.0f * normalised ) + 0.5f ) ); }
+
+// The slider is descriptor axis Z (verified on the bench, docs/joystick.md), inverted on request: bottom = 2000 us, top = 1000 us.
+static uint16_t speedScaleRaw( const joystickState_t* joystick ) { return ( uint16_t )( UINT16_MAX - joystick->z ); }
+
+// RC10 throttle speed scale for the companion computer: 0..65535 maps linearly onto 1000..2000 us.
+static uint16_t speedScalePwm( uint16_t raw ) { return rcClamp( ( int32_t )RC_LOW + ( int32_t )( ( ( uint32_t )raw * 1000UL ) / 65535UL ) ); }
+
+// Unused channels are UINT16_MAX, which ArduPilot treats as "ignore this channel".
+static void sendOverride( int32_t target, uint16_t steer, uint16_t throttle, uint16_t motor, uint16_t trim, uint16_t speed )
+{
+    mavlink_message_t message;
+
+    ( void )mavlink_msg_rc_channels_override_pack( CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &message, ( uint8_t )target, MAV_COMP_ID_AUTOPILOT1, steer, RC_IGNORE, throttle, RC_IGNORE, RC_IGNORE, motor, trim, RC_IGNORE, RC_IGNORE, speed, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE, RC_IGNORE,
+                                                   RC_IGNORE, RC_IGNORE );
+    sendMessage( &message );
+}
+
+// A few neutral, motor-off overrides so a vehicle we stop controlling is left stopped rather than on its last stick values.
+static void sendNeutralBurst( int32_t target, uint16_t speed )
+{
+    for ( int32_t burst = 0; burst < NEUTRAL_BURST_COUNT; burst++ )
+    {
+        sendOverride( target, RC_NEUTRAL, RC_NEUTRAL, RC_LOW, RC_NEUTRAL, speed );
+    }
+}
+
+static bool inMask( uint32_t mask, buttonId_t button ) { return ( mask & BTN_BIT( button ) ) != 0U; }
+
+// 20 Hz control loop: selection changes, e-stop, override enable, motor latch, discrete commands and the RC override stream.
+static void controlTask( void* arg )
+{
+    bool overrideEnabled = false;
+
+    bool motorOn      = false;
+    bool estopActive  = false;
+    bool estopRearmed = true;
+
+    bool vehicleOkPrevious = false;
+    int64_t estopEndUs     = 0;
+
+    int64_t lastEstopCommandUs = 0;
+
+    int32_t estopTicks     = 0;
+    int32_t armTicks       = 0;
+    uint32_t overrideCount = 0U;
+    uint16_t lastSpeed     = RC_LOW;
+    TickType_t lastWake    = xTaskGetTickCount();
+
+    ( void )arg;
+
+    for ( ;; )
+    {
+        vTaskDelayUntil( &lastWake, pdMS_TO_TICKS( CONTROL_PERIOD_MS ) );
+        const uint32_t held   = buttonsHeld();
+        const uint32_t events = buttonsPressedEvents();
+        const int64_t now     = esp_timer_get_time();
+
+        // Boot hold-off: all button activity is ignored for the first 5 s.
+        if ( now < BOOT_HOLDOFF_US ) { continue; }
+
+        // Shared vehicle selection; deferred during an e-stop pulse so the stop completes on the boat it was meant for.
+        const int32_t requested = selectionGet();
+
+        if ( ( requested != targetSysid ) && !estopActive )
+        {
+            const int32_t previous = targetSysid;
+
+            if ( overrideEnabled && ( previous != 0 ) ) { sendNeutralBurst( previous, lastSpeed ); }
+
+            motorOn  = false;
+            armTicks = 0;
+
+            pendingCommand.active = false;
+
+            vehicleArmed = false;
+            vehicleMode  = 0U;
+            targetSysid  = requested;
+            ESP_LOGW( logTag, "target vehicle %" PRId32 " -> %" PRId32 " (motor off)", previous, requested );
+        }
+
+        const bool vehicleOk = ( targetSysid != 0 ) && ( heartbeatSysid == targetSysid ) && ( lastHeartbeatUs != 0 ) && ( ( now - lastHeartbeatUs ) < VEHICLE_LOST_US );
+
+        if ( vehicleOk != vehicleOkPrevious )
+        {
+            ESP_LOGW( logTag, "vehicle %s", vehicleOk ? "heartbeat OK" : "heartbeat LOST" );
+            vehicleOkPrevious = vehicleOk;
+        }
+
+        if ( !vehicleOk && motorOn )
+        {
+            motorOn = false;
+            ESP_LOGW( logTag, "motor OFF (vehicle lost)" );
+        }
+
+        // Emergency shutdown: both buttons held for 300 ms give a 3 s stop pulse, which then clears itself.
+        // Both buttons must be fully released before another stop can fire.
+        const bool bothEstopHeld = inMask( held, buttonEstopA ) && inMask( held, buttonEstopB );
+
+        if ( !inMask( held, buttonEstopA ) && !inMask( held, buttonEstopB ) ) { estopRearmed = true; }
+
+        estopTicks = bothEstopHeld ? ( estopTicks + 1 ) : 0;
+
+        if ( !estopActive && estopRearmed && ( estopTicks >= ESTOP_HOLD_TICKS ) )
+        {
+            estopActive  = true;
+            estopRearmed = false;
+            estopEndUs   = now + ESTOP_PULSE_US;
+            motorOn      = false;
+
+            pendingCommand.active = false;
+            ESP_LOGE( logTag, "EMERGENCY SHUTDOWN: stop pulse for %" PRId32 " s", ( int32_t )( ESTOP_PULSE_US / 1000000 ) );
+        }
+
+        if ( estopActive && ( now >= estopEndUs ) )
+        {
+            estopActive = false;
+            ESP_LOGW( logTag, "emergency shutdown pulse ended, controls released (motor stays off)" );
+        }
+
+        // Force disarm (param2 magic value), repeated until the vehicle reports disarmed.
+        if ( estopActive && vehicleArmed && ( targetSysid != 0 ) && ( ( now - lastEstopCommandUs ) > ESTOP_REPEAT_US ) )
+        {
+            mavlink_message_t message;
+
+            ( void )mavlink_msg_command_long_pack( CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &message, ( uint8_t )targetSysid, MAV_COMP_ID_AUTOPILOT1, MAV_CMD_COMPONENT_ARM_DISARM, 0U, 0.0f, FORCE_DISARM_MAGIC, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f );
+            sendMessage( &message );
+            lastEstopCommandUs = now;
+        }
+
+        if ( inMask( events, buttonOverrideToggle ) )
+        {
+            if ( overrideEnabled )
+            {
+                overrideEnabled = false;
+
+                motorOn = false;
+
+                if ( targetSysid != 0 ) { sendNeutralBurst( targetSysid, lastSpeed ); }
+
+                ESP_LOGW( logTag, "RC override DISABLED (no override messages are sent)" );
             }
-            motor_on = false;
-            arm_ticks = 0;
-            s_pend.active = false;
-            s_veh_armed = false;
-            s_veh_mode = 0;
-            s_target_sysid = req;
-            ESP_LOGW(TAG, "target vehicle %d -> %d (motor off)", old, req);
+            else
+            {
+                overrideEnabled = true;
+
+                motorOn = false;
+                ESP_LOGW( logTag, "RC override ENABLED (motor off)" );
+            }
         }
 
-        bool veh_ok = s_target_sysid != 0 && s_hb_sysid == s_target_sysid && s_last_hb_us != 0 && (now - s_last_hb_us) < VEH_LOST_US;
-
-        if (veh_ok != veh_ok_prev) {
-            ESP_LOGW(TAG, "vehicle %s", veh_ok ? "heartbeat OK" : "heartbeat LOST");
-            veh_ok_prev = veh_ok;
-        }
-        if (!veh_ok && motor_on) { motor_on = false; ESP_LOGW(TAG, "motor OFF (vehicle lost)"); }
-
-        // --- emergency shutdown: both buttons held 300 ms -> a 3 s stop pulse, then it clears itself ---
-        bool both = (held & BTN_BIT(BTN_ESTOP_A)) && (held & BTN_BIT(BTN_ESTOP_B));
-        if (!(held & (BTN_BIT(BTN_ESTOP_A) | BTN_BIT(BTN_ESTOP_B)))) estop_rearm = true;   // fully released
-        estop_ticks = both ? estop_ticks + 1 : 0;
-        if (!estop && estop_rearm && estop_ticks >= ESTOP_HOLD_TICKS) {
-            estop = true;
-            estop_rearm = false;
-            estop_end_us = now + ESTOP_PULSE_US;
-            motor_on = false;
-            s_pend.active = false;
-            ESP_LOGE(TAG, "EMERGENCY SHUTDOWN: stop pulse for %d s", ESTOP_PULSE_US / 1000000);
-        }
-        if (estop && now >= estop_end_us) {
-            estop = false;
-            ESP_LOGW(TAG, "emergency shutdown pulse ended, controls released (motor stays off)");
-        }
-        if (estop && s_veh_armed && s_target_sysid != 0 && now - last_estop_cmd > 200000) {
-            mavlink_message_t m;   // force disarm, repeated until the vehicle reports disarmed
-            mavlink_msg_command_long_pack(CONFIG_MAV_SYSID, CONFIG_MAV_COMPID, &m, s_target_sysid, 1,
-                                          MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 21196, 0, 0, 0, 0, 0);
-            send_msg(&m);
-            last_estop_cmd = now;
+        // Motor on is only accepted with the override enabled, outside an e-stop and with a live vehicle.
+        if ( inMask( events, buttonMotorOff ) )
+        {
+            motorOn = false;
+            ESP_LOGI( logTag, "motor OFF" );
         }
 
-        // --- override enable toggle ---
-        if (ev & BTN_BIT(BTN_OVERRIDE_TOGGLE)) {
-            if (ovr_enabled) {
-                ovr_enabled = false;
-                motor_on = false;
-                if (s_target_sysid != 0) {
-                    for (int i = 0; i < 5; i++) send_override(s_target_sysid, 1500, 1500, 1000, 1500, last_speed);  // neutral burst, then stop
+        if ( inMask( events, buttonMotorOn ) )
+        {
+            if ( overrideEnabled && !estopActive && vehicleOk )
+            {
+                motorOn = true;
+                ESP_LOGI( logTag, "motor ON" );
+            }
+            else { ESP_LOGW( logTag, "motor ON refused: override %s, e-stop pulse %s, vehicle heartbeat %s", overrideEnabled ? "enabled" : "DISABLED (press the override button)", estopActive ? "ACTIVE" : "inactive", vehicleOk ? "ok" : "LOST" ); }
+        }
+
+        // Discrete commands are blocked during the e-stop pulse; disarm is always allowed.
+        if ( !estopActive )
+        {
+            const float32_t customMode = ( float32_t )MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+
+            if ( inMask( events, buttonMode1 ) ) { commandStart( "mode Manual", MAV_CMD_DO_SET_MODE, customMode, ( float32_t )ROVER_MODE_MANUAL ); }
+
+            if ( inMask( events, buttonMode2 ) ) { commandStart( "mode Hold", MAV_CMD_DO_SET_MODE, customMode, ( float32_t )ROVER_MODE_HOLD ); }
+
+            if ( inMask( events, buttonMode3 ) ) { commandStart( "mode Auto", MAV_CMD_DO_SET_MODE, customMode, ( float32_t )ROVER_MODE_AUTO ); }
+
+            if ( inMask( events, buttonMode4 ) ) { commandStart( "mode RTL", MAV_CMD_DO_SET_MODE, customMode, ( float32_t )ROVER_MODE_RTL ); }
+
+            // Arm sits on the trigger: only a deliberate 0.8 s hold arms.
+            armTicks = inMask( held, buttonArm ) ? ( armTicks + 1 ) : 0;
+
+            if ( armTicks == ARM_HOLD_TICKS ) { commandStart( "arm", MAV_CMD_COMPONENT_ARM_DISARM, 1.0f, 0.0f ); }
+        }
+
+        if ( inMask( events, buttonDisarm ) ) { commandStart( "disarm", MAV_CMD_COMPONENT_ARM_DISARM, 0.0f, 0.0f ); }
+
+        commandService();
+
+        joystickState_t joystick;
+
+        if ( overrideEnabled && ( targetSysid != 0 ) && joystickGet( &joystick ) )
+        {
+            const bool driving   = motorOn && !estopActive;
+            const bool trimUp    = inMask( held, buttonTrimUp );
+            const bool trimDown  = inMask( held, buttonTrimDown );
+            const uint16_t speed = speedScalePwm( speedScaleRaw( &joystick ) );
+            const uint16_t motor = driving ? RC_HIGH : RC_LOW;
+            uint16_t steer       = toPwm( axisNormalise( joystick.x ) );
+
+            uint16_t trim = RC_NEUTRAL;
+
+            // Forward is Y low on this stick, hence the sign flip.
+            const uint16_t throttle = driving ? toPwm( -axisNormalise( joystick.y ) ) : RC_NEUTRAL;
+
+            // Both trim buttons held counts as neither.
+            if ( trimUp != trimDown ) { trim = trimUp ? RC_HIGH : RC_LOW; }
+
+            if ( estopActive )
+            {
+                steer = RC_NEUTRAL;
+                trim  = RC_NEUTRAL;
+            }
+
+            lastSpeed = speed;
+            sendOverride( targetSysid, steer, throttle, motor, trim, speed );
+            overrideCount++;
+
+            if ( ( overrideCount % OVERRIDE_LOG_EVERY ) == 0U ) { ESP_LOGI( logTag, "RC override -> sys %" PRId32 ": ch1 %u ch3 %u ch6 %u ch7 %u ch10 %u | veh %s mode %" PRIu32, targetSysid, steer, throttle, motor, trim, speed, vehicleArmed ? "ARMED" : "disarmed", vehicleMode ); }
+        }
+    }
+}
+
+// Receives MAVLink from the hub and keeps the selected vehicle's heartbeat state and command ACKs.
+static void rxTask( void* arg )
+{
+    uint8_t buffer[RX_BUFFER_LEN];
+    mavlink_message_t message;
+    mavlink_status_t status;
+
+    ( void )arg;
+
+    for ( ;; )
+    {
+        const int32_t received = ( int32_t )recv( udpSocket, buffer, sizeof( buffer ), 0 );
+
+        for ( int32_t index = 0; index < received; index++ )
+        {
+            const int32_t target = targetSysid;
+
+            if ( ( mavlink_parse_char( MAVLINK_COMM_0, buffer[index], &message, &status ) != 0U ) && ( target != 0 ) && ( ( int32_t )message.sysid == target ) )
+            {
+                if ( ( message.msgid == MAVLINK_MSG_ID_HEARTBEAT ) && ( message.compid == MAV_COMP_ID_AUTOPILOT1 ) )
+                {
+                    mavlink_heartbeat_t heartbeat;
+
+                    mavlink_msg_heartbeat_decode( &message, &heartbeat );
+                    vehicleArmed    = ( heartbeat.base_mode & MAV_MODE_FLAG_SAFETY_ARMED ) != 0U;
+                    vehicleMode     = heartbeat.custom_mode;
+                    heartbeatSysid  = ( int32_t )message.sysid;
+                    lastHeartbeatUs = esp_timer_get_time();
                 }
-                ESP_LOGW(TAG, "RC override DISABLED (no override messages are sent)");
-            } else {
-                ovr_enabled = true;
-                motor_on = false;
-                ESP_LOGW(TAG, "RC override ENABLED (motor off)");
-            }
-        }
+                else if ( message.msgid == MAVLINK_MSG_ID_COMMAND_ACK )
+                {
+                    mavlink_command_ack_t ack;
 
-        // --- motor on/off (only with override enabled, not during e-stop) ---
-        if (ev & BTN_BIT(BTN_MOTOR_OFF)) { motor_on = false; ESP_LOGI(TAG, "motor OFF"); }
-        if (ev & BTN_BIT(BTN_MOTOR_ON)) {
-            if (ovr_enabled && !estop && veh_ok) { motor_on = true; ESP_LOGI(TAG, "motor ON"); }
-            else ESP_LOGW(TAG, "motor ON refused: override %s, e-stop pulse %s, vehicle heartbeat %s",
-                          ovr_enabled ? "enabled" : "DISABLED (press the override button)", estop ? "ACTIVE" : "inactive", veh_ok ? "ok" : "LOST");
-        }
-
-        // --- discrete commands (blocked during e-stop) ---
-        if (!estop) {
-            if (ev & BTN_BIT(BTN_MODE1)) cmd_start("mode Manual", MAV_CMD_DO_SET_MODE, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, ROVER_MODE_MANUAL);
-            if (ev & BTN_BIT(BTN_MODE2)) cmd_start("mode Hold",   MAV_CMD_DO_SET_MODE, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, ROVER_MODE_HOLD);
-            if (ev & BTN_BIT(BTN_MODE3)) cmd_start("mode Auto",   MAV_CMD_DO_SET_MODE, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, ROVER_MODE_AUTO);
-            if (ev & BTN_BIT(BTN_MODE4)) cmd_start("mode RTL",    MAV_CMD_DO_SET_MODE, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, ROVER_MODE_RTL);
-            // Arm sits on the trigger: only a deliberate ~0.8 s hold arms.
-            arm_ticks = (held & BTN_BIT(BTN_ARM)) ? arm_ticks + 1 : 0;
-            if (arm_ticks == ARM_HOLD_TICKS) cmd_start("arm", MAV_CMD_COMPONENT_ARM_DISARM, 1, 0);
-        }
-        if (ev & BTN_BIT(BTN_DISARM)) cmd_start("disarm", MAV_CMD_COMPONENT_ARM_DISARM, 0, 0);
-        cmd_service();
-
-        // --- RC override stream ---
-        joystick_state_t js;
-        if (ovr_enabled && s_target_sysid != 0 && joystick_get(&js)) {
-            uint16_t steer = to_pwm(axis_norm(js.x));
-            uint16_t thr = (motor_on && !estop) ? to_pwm(-axis_norm(js.y)) : 1500;   // forward = Y low
-            uint16_t motor = (motor_on && !estop) ? 2000 : 1000;
-            bool up = held & BTN_BIT(BTN_TRIM_UP), dn = held & BTN_BIT(BTN_TRIM_DOWN);
-            uint16_t trim = (up == dn) ? 1500 : (up ? 2000 : 1000);
-            if (estop) { steer = 1500; trim = 1500; }
-            uint16_t speed = speed_scale_pwm(SPEED_SCALE_RAW(js));
-            last_speed = speed;
-            send_override(s_target_sysid, steer, thr, motor, trim, speed);
-            if (++n % 20 == 0)
-                ESP_LOGI(TAG, "RC override -> sys %d: ch1 %u ch3 %u ch6 %u ch7 %u ch10 %u | veh %s mode %lu",
-                         s_target_sysid, steer, thr, motor, trim, speed, s_veh_armed ? "ARMED" : "disarmed", (unsigned long)s_veh_mode);
-        }
-    }
-}
-
-static void rx_task(void *arg)
-{
-    uint8_t buf[512];
-    mavlink_message_t msg;
-    mavlink_status_t st;
-    for (;;) {
-        int n = recv(s_sock, buf, sizeof(buf), 0);
-        for (int i = 0; i < n; i++) {
-            if (!mavlink_parse_char(MAVLINK_COMM_0, buf[i], &msg, &st)) continue;
-            int target = s_target_sysid;
-            if (target == 0 || msg.sysid != target) continue;
-            if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT && msg.compid == 1) {
-                mavlink_heartbeat_t hb;
-                mavlink_msg_heartbeat_decode(&msg, &hb);
-                s_veh_armed = hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED;
-                s_veh_mode = hb.custom_mode;
-                s_hb_sysid = msg.sysid;
-                s_last_hb_us = esp_timer_get_time();
-            } else if (msg.msgid == MAVLINK_MSG_ID_COMMAND_ACK) {
-                mavlink_command_ack_t ack;
-                mavlink_msg_command_ack_decode(&msg, &ack);
-                s_ack_result = ack.result;
-                s_ack_cmd = ack.command;
+                    mavlink_msg_command_ack_decode( &message, &ack );
+                    ackResult  = ( int32_t )ack.result;
+                    ackCommand = ( int32_t )ack.command;
+                }
+                else
+                {
+                    // Other messages from the vehicle are not used here.
+                }
             }
         }
     }
 }
 
-void app_main(void)
+void app_main( void )
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
-    buttons_start();
-    joystick_start();
-    s_ev = xEventGroupCreate();
-    eth_start();
-    xEventGroupWaitBits(s_ev, GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    const struct sockaddr_in localAddress = { .sin_family = AF_INET, .sin_port = htons( LOCAL_UDP_PORT ), .sin_addr.s_addr = htonl( INADDR_ANY ) };
 
-    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    memset(&s_hub, 0, sizeof(s_hub));
-    s_hub.sin_family = AF_INET;
-    s_hub.sin_port = htons(CONFIG_HUB_PORT);
-    inet_pton(AF_INET, CONFIG_HUB_IP, &s_hub.sin_addr);
-    // Bind so the router learns a stable source port.
-    struct sockaddr_in local = { .sin_family = AF_INET, .sin_port = htons(14561), .sin_addr.s_addr = htonl(INADDR_ANY) };
-    bind(s_sock, (struct sockaddr *)&local, sizeof(local));
-    selection_start();
+    ESP_ERROR_CHECK( nvs_flash_init() );
+    buttonsStart();
+    joystickStart();
+    networkEvents = xEventGroupCreate();
+    ethernetStart();
+    ( void )xEventGroupWaitBits( networkEvents, GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY );
 
-    xTaskCreate(heartbeat_task, "hb", 4096, NULL, 5, NULL);
-    xTaskCreate(rx_task, "rx", 8192, NULL, 5, NULL);
-    xTaskCreate(control_task, "ctrl", 6144, NULL, 6, NULL);
+    udpSocket = socket( AF_INET, SOCK_DGRAM, IPPROTO_IP );
+    ( void )memset( &hubAddress, 0, sizeof( hubAddress ) );
+    hubAddress.sin_family = AF_INET;
+    hubAddress.sin_port   = htons( CONFIG_HUB_PORT );
+    ( void )inet_pton( AF_INET, CONFIG_HUB_IP, &hubAddress.sin_addr );
+    ( void )bind( udpSocket, ( const struct sockaddr* )&localAddress, sizeof( localAddress ) );
+    selectionStart();
+
+    ( void )xTaskCreate( heartbeatTask, "hb", 4096, NULL, 5, NULL );
+    ( void )xTaskCreate( rxTask, "rx", 8192, NULL, 5, NULL );
+    ( void )xTaskCreate( controlTask, "ctrl", 6144, NULL, 6, NULL );
 }
