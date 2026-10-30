@@ -1,0 +1,73 @@
+/home/tkm/soft_dev/aquadrone_control_station/tools/analyze_rover_tlog.py:105: RuntimeWarning: invalid value encountered in scalar divide
+  return f[mask][i], p[mask][i] / p[mask].sum()
+log span 1391 s, PID_TUNING n=5554 (4.0 Hz), ATTITUDE n=5554, SERVO_OUTPUT_RAW n=2777, NAV n=988
+logged ATC_STR_RAT_P/I/FF/IMAX = 0.3499999940395355/0.019999999552965164/0.6000000238418579/0.10000000149011612, RAT_MAX=18.0, ACC_MAX=6.5, FLTT/FLTE=2.0/2.0, SMAX=9.0
+logged CRUISE_SPEED/THROTTLE=2.9468588829040527/26.0, WP_SPEED=2.5, WP_ACCEL=0.800000011920929, MOT_VEC_ANGLEMAX=35.0, MOT_SLEWRATE=40.0, TURN_RADIUS=25.0, WP_RADIUS=10.0
+
+== segments ==
+     seg     mode    start      dur      spd     thr% tgt_rate act_rate rate_err  out_rms    P_rms    I_rms   FF_rms     sat% xtrk_rms     T_zc   f_peak
+       0   MANUAL        0      239     3.79     22.4     0.00     0.00     0.00    0.000    0.000    0.000    0.000      1.1      nan      nan    0.021
+       1     AUTO      239       17     2.98     62.7    10.69     7.13     6.50    0.147    0.040    0.004    0.112     22.6    21.84      nan    0.065
+       2   MANUAL      257      189     1.23      5.0    10.73     3.62     7.10    0.154    0.033    0.010    0.112      8.8      nan      nan    0.021
+       3     AUTO      446      298     2.23     25.8     4.07     4.56     2.51    0.052    0.015    0.016    0.043      3.4     3.43     14.2    0.027
+       4   MANUAL      743       78     3.33     20.3    15.91    13.85     2.06    0.183    0.014    0.002    0.167      0.0      nan      nan    0.026
+       5     AUTO      821      113     2.94     39.5     4.05     8.05     6.98    0.065    0.042    0.016    0.042      1.8     4.07      2.6    0.435
+       6   MANUAL      934      225     0.67      2.8     1.07    16.93    15.86    0.062    0.094    0.021    0.011      3.1      nan      nan    0.022
+       7     AUTO     1158       66     2.58     37.6     8.88     8.33     7.16    0.122    0.043    0.010    0.093     17.8     5.81      9.8    0.031
+       8   MANUAL     1225      166     5.77     36.4     3.17    14.86    11.69    0.029    0.053    0.010    0.033      1.5      nan      nan    0.024
+
+== AUTO straight-line windows (|target| < 6 deg/s, >15 s after WP change) ==
+ seg      t0    dur   spd  thr%  act_rms  hf_rms  out_rms servo_pp xtrk_rms   T_zc  f_peak  lag_s  corr
+   3     461     55  2.13  28.5     1.63    0.47    0.029       94     4.00   22.4   0.036   4.73  0.78
+   3     706     25  2.01  22.0     5.09    1.20    0.029      459     2.37    4.8   0.040   3.00  0.69
+   5     836     31  3.01  38.8     6.50    6.27    0.042      149     5.77    2.3   0.445   1.00  0.92
+
+== AUTO waypoint transitions (25 s after each WP change) ==
+ seg       t  wp hdg_chg tgt_max act_max out_max servo_min servo_max sat_s xtrk_max xtrk_30s t_settle
+   3     528   2      10    12.9    15.0   0.133      1324      1598   0.0      4.3      1.0      6.5
+   3     574   3     -30    11.4    11.2   0.146      1534      1737   0.0      4.5      1.9     54.0
+   3     619   4     -47    18.0    21.9   0.239      1443      1800   1.0      5.6      3.4     31.0
+   3     649   5     -24    11.9    18.6   0.105      1338      1800   0.5      5.0      2.9     53.5
+   3     691   6     -77    18.0    21.9   0.215      1410      1781   0.0      5.0      3.0     11.5
+   5     880   2     -23     9.3    13.6   0.129      1458      1643   0.0      2.3      1.1      nan
+   5     915   3      -5     7.7    21.6   0.136      1394      1662   0.0      2.3      nan      nan
+   7    1211   4     -89    10.0    21.8   0.126      1396      1800   2.0      5.7      nan      nan
+
+== vectored-thrust mixer: post-mixer steering vs PID output (AUTO only) ==
+seg 1: median servo_norm/pid_out = 2.75 (1/thr*1/0.611 predicts 2.53), thr median 65%
+seg 3: median servo_norm/pid_out = 5.37 (1/thr*1/0.611 predicts 4.42), thr median 37%
+seg 5: median servo_norm/pid_out = 4.10 (1/thr*1/0.611 predicts 3.54), thr median 46%
+seg 7: median servo_norm/pid_out = 3.79 (1/thr*1/0.611 predicts 3.37), thr median 49%
+
+== MANUAL: servo PWM -> yaw rate (lag, gain) ==
+seg 0: n=276, speed 3.79 m/s, lag 0.99 s (corr 0.88), gain 23.6 deg/s per full servo deflection, |yaw_rate| 95th pct 15.6 deg/s, max 25.9
+seg 2: n=94, speed 1.23 m/s, lag 1.49 s (corr 0.98), gain 15.9 deg/s per full servo deflection, |yaw_rate| 95th pct 20.4 deg/s, max 22.7
+seg 4: n=98, speed 3.33 m/s, lag 0.50 s (corr 0.87), gain 19.4 deg/s per full servo deflection, |yaw_rate| 95th pct 6.8 deg/s, max 9.0
+seg 6: n=76, speed 0.67 m/s, lag 1.49 s (corr 0.86), gain 20.5 deg/s per full servo deflection, |yaw_rate| 95th pct 22.0 deg/s, max 24.7
+seg 8: n=300, speed 5.77 m/s, lag 0.99 s (corr 0.92), gain 24.6 deg/s per full servo deflection, |yaw_rate| 95th pct 9.8 deg/s, max 27.7
+
+== yaw-rate 0.25-0.8 Hz band RMS by mode (ATTITUDE.yawspeed, speed > 1.5 m/s, 60 s windows) ==
+seg  0 MANUAL  t=     5s spd=1.95 thr=19.1% yaw_rate rms= 7.67 band(0.25-0.8Hz) rms= 1.53 peak 0.03 Hz ( 34% of power)
+seg  0 MANUAL  t=    65s spd=4.20 thr=24.7% yaw_rate rms= 2.61 band(0.25-0.8Hz) rms= 1.16 peak 0.18 Hz ( 10% of power)
+seg  0 MANUAL  t=   125s spd=7.34 thr=40.4% yaw_rate rms= 2.22 band(0.25-0.8Hz) rms= 1.19 peak 0.47 Hz (  6% of power)
+seg  2 MANUAL  t=   262s spd=2.06 thr= 6.3% yaw_rate rms= 6.63 band(0.25-0.8Hz) rms= 0.73 peak 0.03 Hz ( 28% of power)
+seg  3 AUTO    t=   451s spd=2.19 thr=26.4% yaw_rate rms= 3.13 band(0.25-0.8Hz) rms= 1.40 peak 0.03 Hz ( 64% of power)
+seg  3 AUTO    t=   511s spd=2.33 thr=25.8% yaw_rate rms= 3.04 band(0.25-0.8Hz) rms= 0.80 peak 0.03 Hz ( 37% of power)
+seg  3 AUTO    t=   571s spd=2.29 thr=31.1% yaw_rate rms= 4.74 band(0.25-0.8Hz) rms= 1.14 peak 0.05 Hz ( 22% of power)
+seg  3 AUTO    t=   631s spd=2.15 thr=22.3% yaw_rate rms= 4.10 band(0.25-0.8Hz) rms= 1.04 peak 0.07 Hz ( 12% of power)
+seg  4 MANUAL  t=   748s spd=3.85 thr=25.6% yaw_rate rms= 2.38 band(0.25-0.8Hz) rms= 0.86 peak 0.05 Hz ( 12% of power)
+seg  5 AUTO    t=   826s spd=2.94 thr=39.1% yaw_rate rms= 5.78 band(0.25-0.8Hz) rms= 4.53 peak 0.43 Hz ( 33% of power)
+seg  7 AUTO    t=  1163s spd=2.67 thr=39.0% yaw_rate rms= 7.99 band(0.25-0.8Hz) rms= 4.42 peak 0.07 Hz ( 22% of power)
+seg  8 MANUAL  t=  1230s spd=2.75 thr=26.6% yaw_rate rms= 7.84 band(0.25-0.8Hz) rms= 1.50 peak 0.03 Hz ( 19% of power)
+seg  8 MANUAL  t=  1290s spd=6.63 thr=41.8% yaw_rate rms= 2.53 band(0.25-0.8Hz) rms= 0.80 peak 0.03 Hz ( 41% of power)
+
+== speed loop (AUTO) ==
+seg 1: groundspeed mean 3.62 (min 0.74 max 6.97), throttle mean 74.1% range 24-100%, throttle dominant period 12 s, NAV aspd_error all-zero: True
+seg 3: groundspeed mean 2.24 (min 1.59 max 3.11), throttle mean 25.8% range 3-38%, throttle dominant period 49 s, NAV aspd_error all-zero: True
+seg 5: groundspeed mean 2.99 (min 2.02 max 3.59), throttle mean 39.8% range 35-44%, throttle dominant period 8 s, NAV aspd_error all-zero: True
+seg 7: groundspeed mean 2.68 (min 0.76 max 3.71), throttle mean 39.0% range 13-46%, throttle dominant period 20 s, NAV aspd_error all-zero: True
+
+yaw-rate capability (speed>1.5 m/s): 99th pct 21.9 deg/s, max 27.7 deg/s
+commanded steering PWM slew: 95th pct 124 us/s, max 9454 us/s (full range 600 us); SERVO_OUTPUT_RAW rate 2.0 Hz
+
+plots written to docs/img/
